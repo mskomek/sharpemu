@@ -10,6 +10,7 @@ public static class NpManagerExports
 {
     private const int NpTitleIdSize = 16;
     private const int NpTitleSecretSize = 128;
+    private const int NpErrorInvalidArgument = unchecked((int)0x80550003);
 
     [SysAbiExport(
         Nid = "3Zl8BePTh9Y",
@@ -58,28 +59,6 @@ public static class NpManagerExports
     }
 
     [SysAbiExport(
-        Nid = "rbknaUjpqWo",
-        ExportName = "sceNpGetAccountIdA",
-        Target = Generation.Gen5,
-        LibraryName = "libSceNpManager")]
-    public static int NpGetOnlineIdA(CpuContext ctx)
-    {
-        // The A variant takes a user ID before OnlineId.
-        return WriteOfflineOnlineId(ctx, ctx[CpuRegister.Rsi]);
-    }
-
-    [SysAbiExport(
-        Nid = "e-ZuhGEoeC4",
-        ExportName = "sceNpGetNpReachabilityState",
-        Target = Generation.Gen4 | Generation.Gen5,
-        LibraryName = "libSceNpManager")]
-    public static int NpGetNpReachabilityState(CpuContext ctx)
-    {
-        ctx[CpuRegister.Rax] = 0;
-        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
-    }
-
-    [SysAbiExport(
         Nid = "VfRSmPmj8Q8",
         ExportName = "sceNpRegisterStateCallback",
         Target = Generation.Gen4 | Generation.Gen5,
@@ -88,6 +67,42 @@ public static class NpManagerExports
     {
         ctx[CpuRegister.Rax] = 0;
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    /// <summary>
+    /// Accepts the reachability callback and never invokes it. Reachability
+    /// transitions only ever fire on a real PSN connection, which an offline
+    /// session does not have, so registering successfully and staying silent is
+    /// the accurate emulation of a signed-out console rather than a stub.
+    /// </summary>
+    [SysAbiExport(
+        Nid = "hw5KNqAAels",
+        ExportName = "sceNpRegisterNpReachabilityStateCallback",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceNpManager")]
+    public static int NpRegisterNpReachabilityStateCallback(CpuContext ctx)
+    {
+        ctx[CpuRegister.Rax] = 0;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    /// <summary>
+    /// Accepts the premium-event callback and never invokes it. Offline sessions
+    /// have no PS Plus / premium transitions to deliver, and leaving this NID
+    /// unresolved returns NOT_FOUND which soft-locks titles that register it
+    /// during settings / store probes (GTA V Enhanced).
+    /// </summary>
+    [SysAbiExport(
+        Nid = "+yqjab2fUJA",
+        ExportName = "sceNpRegisterPremiumEventCallback",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceNpManager")]
+    public static int NpRegisterPremiumEventCallback(CpuContext ctx)
+    {
+        TraceNp(
+            $"register_premium_event_callback cb=0x{ctx[CpuRegister.Rdi]:X16} " +
+            $"userdata=0x{ctx[CpuRegister.Rsi]:X16}");
+        return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_OK);
     }
 
     [SysAbiExport(
@@ -133,6 +148,77 @@ public static class NpManagerExports
     }
 
     [SysAbiExport(
+        Nid = "rbknaUjpqWo",
+        ExportName = "sceNpGetAccountIdA",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceNpManager")]
+    public static int NpGetAccountIdA(CpuContext ctx)
+    {
+        var userId = unchecked((int)ctx[CpuRegister.Rdi]);
+        var accountIdAddress = ctx[CpuRegister.Rsi];
+        if (userId == -1 || accountIdAddress == 0)
+        {
+            return SetReturn(ctx, NpErrorInvalidArgument);
+        }
+
+        // The offline profile exposed by sceNpGetState is signed in. Keep the
+        // account query consistent with that state: Unity's PSN integration
+        // treats SIGNED_OUT as an exceptional state and retries it every frame.
+        // A stable local-only id is sufficient for titles which only use the
+        // value as a profile key.
+        Span<byte> accountId = stackalloc byte[sizeof(ulong)];
+        BinaryPrimitives.WriteUInt64LittleEndian(accountId, 1);
+        return ctx.Memory.TryWrite(accountIdAddress, accountId)
+            ? SetReturn(ctx, (int)OrbisGen2Result.ORBIS_GEN2_OK)
+            : SetReturn(ctx, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+    }
+
+    [SysAbiExport(
+        Nid = "JT+t00a3TxA",
+        ExportName = "sceNpGetAccountCountryA",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceNpManager")]
+    public static int NpGetAccountCountryA(CpuContext ctx)
+    {
+        var userId = unchecked((int)ctx[CpuRegister.Rdi]);
+        var countryAddress = ctx[CpuRegister.Rsi];
+        if (userId == -1 || countryAddress == 0)
+        {
+            return SetReturn(ctx, NpErrorInvalidArgument);
+        }
+
+        Span<byte> country = stackalloc byte[4];
+        country[0] = (byte)'U';
+        country[1] = (byte)'S';
+        country[2] = 0;
+        country[3] = 0;
+        return ctx.Memory.TryWrite(countryAddress, country)
+            ? SetReturn(ctx, (int)OrbisGen2Result.ORBIS_GEN2_OK)
+            : SetReturn(ctx, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+    }
+
+    [SysAbiExport(
+        Nid = "e-ZuhGEoeC4",
+        ExportName = "sceNpGetNpReachabilityState",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceNpManager")]
+    public static int NpGetNpReachabilityState(CpuContext ctx)
+    {
+        var userId = unchecked((int)ctx[CpuRegister.Rdi]);
+        var stateAddress = ctx[CpuRegister.Rsi];
+        if (userId == -1 || stateAddress == 0)
+        {
+            return SetReturn(ctx, NpErrorInvalidArgument);
+        }
+
+        Span<byte> state = stackalloc byte[sizeof(uint)];
+        BinaryPrimitives.WriteUInt32LittleEndian(state, 0); // Unavailable while offline.
+        return ctx.Memory.TryWrite(stateAddress, state)
+            ? SetReturn(ctx, (int)OrbisGen2Result.ORBIS_GEN2_OK)
+            : SetReturn(ctx, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+    }
+
+    [SysAbiExport(
         Nid = "Ec63y59l9tw",
         ExportName = "sceNpSetNpTitleId",
         Target = Generation.Gen4 | Generation.Gen5,
@@ -156,6 +242,12 @@ public static class NpManagerExports
 
         TraceNp($"set_np_title_id title='{ReadTitleId(titleId)}'");
         return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_OK);
+    }
+
+    private static int SetReturn(CpuContext ctx, int result)
+    {
+        ctx[CpuRegister.Rax] = unchecked((ulong)result);
+        return result;
     }
 
     private static string ReadTitleId(ReadOnlySpan<byte> bytes)

@@ -2,9 +2,11 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 using Avalonia;
+using Avalonia.Automation;
 using Avalonia.Collections;
 using Avalonia.Controls;
 using Avalonia.Input;
+using Avalonia.Input.Platform;
 using Avalonia.Interactivity;
 using Avalonia.Media;
 using Avalonia.Media.Imaging;
@@ -12,14 +14,18 @@ using Avalonia.Platform;
 using Avalonia.Platform.Storage;
 using Avalonia.Threading;
 using Avalonia.VisualTree;
+using SharpEmu.Core.Cpu;
+using SharpEmu.Core.Runtime;
 using SharpEmu.HLE.Host;
-using SharpEmu.HLE.Host.Windows;
+using SharpEmu.Libs.Pad;
+using SharpEmu.Libs.VideoOut;
 using SharpEmu.Logging;
 using System.Collections.Concurrent;
 using System.Collections.ObjectModel;
 using System.Diagnostics;
 using System.Reflection;
 using System.Text.Json;
+using System.Net.Http.Headers;
 
 namespace SharpEmu.GUI;
 
@@ -27,6 +33,8 @@ public partial class MainWindow : Window
 {
     private const int MaxConsoleLines = 4000;
     private const int MaxConsoleLinesPerFlush = 500;
+    private const double LaunchBlurRadius = 12;
+    private const double BlurTransitionSeconds = 0.24;
 
     private static readonly IBrush DefaultLineBrush = new SolidColorBrush(Color.Parse("#C7CFDE"));
     private static readonly IBrush DimLineBrush = new SolidColorBrush(Color.Parse("#6B7488"));
@@ -34,23 +42,76 @@ public partial class MainWindow : Window
     private static readonly IBrush WarningLineBrush = new SolidColorBrush(Color.Parse("#E8B341"));
     private static readonly IBrush ErrorLineBrush = new SolidColorBrush(Color.Parse("#F2777C"));
     private static readonly IBrush SuccessLineBrush = new SolidColorBrush(Color.Parse("#63D489"));
-
+    private readonly LocalizedChoice[] _cpuEngineChoices =
+    [
+        LocalizedChoice.FromKey("Native", "Options.CpuEngine.Native"),
+    ];
+    private readonly LocalizedChoice[] _logLevelChoices =
+    [
+        LocalizedChoice.FromKey("Trace", "Options.LogLevel.Trace"),
+        LocalizedChoice.FromKey("Debug", "Options.LogLevel.Debug"),
+        LocalizedChoice.FromKey("Info", "Options.LogLevel.Info"),
+        LocalizedChoice.FromKey("Warning", "Options.LogLevel.Warning"),
+        LocalizedChoice.FromKey("Error", "Options.LogLevel.Error"),
+        LocalizedChoice.FromKey("Critical", "Options.LogLevel.Critical"),
+    ];
+    private readonly LocalizedChoice[] _renderResolutionChoices =
+    [
+        LocalizedChoice.FromKey("1.0", "Options.RenderResolution.Native"),
+        LocalizedChoice.Literal("0.75", "75%"),
+        LocalizedChoice.Literal("0.5", "50%"),
+        LocalizedChoice.Literal("0.25", "25%"),
+    ];
+    private readonly LocalizedChoice[] _windowModeChoices =
+    [
+        LocalizedChoice.FromKey("Windowed", "Options.WindowMode.Windowed"),
+        LocalizedChoice.FromKey("Borderless", "Options.WindowMode.Borderless"),
+        LocalizedChoice.FromKey("Exclusive", "Options.WindowMode.Exclusive"),
+    ];
+    private readonly LocalizedChoice[] _scalingModeChoices =
+    [
+        LocalizedChoice.FromKey("Fit", "Options.Scaling.Fit"),
+        LocalizedChoice.FromKey("Cover", "Options.Scaling.Cover"),
+        LocalizedChoice.FromKey("Stretch", "Options.Scaling.Stretch"),
+        LocalizedChoice.FromKey("Integer", "Options.Scaling.Integer"),
+    ];
+    private readonly LocalizedChoice[] _hdrModeChoices =
+    [
+        LocalizedChoice.FromKey("Auto", "Options.Hdr.Auto"),
+        LocalizedChoice.FromKey("On", "Common.On"),
+        LocalizedChoice.FromKey("Off", "Common.Off"),
+    ];
     private readonly List<GameEntry> _allGames = new();
     private readonly ObservableCollection<GameEntry> _visibleGames = new();
+    private readonly GameLibraryWatcher _libraryWatcher = new();
     private readonly AvaloniaList<LogLine> _consoleLines = new();
     private readonly List<LogLine> _allConsoleLines = new();
     private readonly ConcurrentQueue<(string Line, bool IsError)> _pendingLines = new();
     private readonly DispatcherTimer _consoleFlushTimer;
+    private readonly DispatcherTimer _libraryBlurTimer;
+    private BlurEffect? _libraryBlur;
+    private double _libraryBlurStartRadius;
+    private double _libraryBlurTargetRadius;
+    private long _libraryBlurStartedAt;
+    private bool _clearLibraryBlurWhenComplete;
 
     private GuiSettings _settings = new();
+    private IReadOnlyList<HostDisplayOption> _hostDisplays = [];
+    private bool _updatingHostDisplayOptions;
     private EmulatorProcess? _emulator;
     private ConsoleWindow? _consoleWindow;
+    private GuiConsoleMirror? _consoleMirror;
     private StreamWriter? _fileLog;
     private readonly SndPreviewPlayer _sndPreview = new();
     private string? _emulatorExePath;
+    private PendingLaunch? _pendingLaunch;
     private bool _isRunning;
+    private bool _isStopping;
     private int _autoScrollTicks;
     private int _activePageIndex;
+    private Updater.UpdateInfo? _availableUpdate;
+    private string _updateStatusKey = "Updater.Status.Ready";
+    private object?[] _updateStatusArgs = [BuildInfo.CommitSha ?? "dev"];
 
     // Discord Rich Presence state.
     private readonly long _launcherStartUnixSeconds = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
@@ -58,8 +119,19 @@ public partial class MainWindow : Window
     private string? _runningGameName;
     private string? _runningGameTitleId;
     private long _runningSinceUnixSeconds;
+    private int _libraryScanGeneration;
     private int _detailLoadGeneration;
     private int _backdropGeneration;
+    private bool _isClosing;
+
+    // Bundled key art shown whenever no game-specific backdrop applies; the
+    // plain window color remains the fallback when the asset fails to load.
+    private Bitmap? _defaultBackdrop;
+
+    // Whether the native loading/closing popup should be showing; it is a
+    // desktop-topmost popup, so it closes while the launcher is in the
+    // background or minimized and reopens from this flag on activation.
+    private bool _sessionLoadingActive;
 
     // Controller navigation state.
     private readonly DispatcherTimer _gamepadTimer;
@@ -69,12 +141,40 @@ public partial class MainWindow : Window
     private long _navUpNextAt;
     private long _navDownNextAt;
 
+    //Github http client for latest commit
+    private static readonly HttpClient GithubHttpClient = CreateGithubHttpClient();
+    private string? _latestCommitSha;
+
+    private sealed record PendingLaunch(
+        string EbootPath,
+        string DisplayName,
+        string? TitleId,
+        EffectiveLaunchSettings Settings,
+        SharpEmuRuntimeOptions RuntimeOptions);
+
     public MainWindow()
     {
         InitializeComponent();
+        InitializeLocalizedChoiceBoxes();
+
+        try
+        {
+            _defaultBackdrop = new Bitmap(
+                AssetLoader.Open(new Uri("avares://SharpEmu.GUI/Assets/pic0.png")));
+            BackdropImage.Source = _defaultBackdrop;
+            BackdropImage.Opacity = 1.0;
+        }
+        catch (Exception)
+        {
+            _defaultBackdrop = null; // color background remains the fallback
+        }
 
         GameList.ItemsSource = _visibleGames;
+        _libraryWatcher.RefreshRequested += OnLibraryRefreshRequested;
         ConsoleList.ItemsSource = _consoleLines;
+        _consoleMirror = GuiConsoleMirror.Install((line, isError) =>
+            _pendingLines.Enqueue((line, isError)));
+        Closed += (_, _) => _emulator?.Stop();
 
         _consoleFlushTimer = new DispatcherTimer
         {
@@ -87,20 +187,50 @@ public partial class MainWindow : Window
         };
         _consoleFlushTimer.Start();
 
+        _libraryBlurTimer = new DispatcherTimer
+        {
+            Interval = TimeSpan.FromMilliseconds(16),
+        };
+        _libraryBlurTimer.Tick += (_, _) => AdvanceLibraryBlur();
+
+        // Native popups float above every window on the desktop; they must
+        // follow the launcher into the background or a minimized state.
+        Activated += (_, _) =>
+        {
+            SessionLoadingPopup.IsOpen = _sessionLoadingActive;
+        };
+        Deactivated += (_, _) =>
+        {
+            SessionLoadingPopup.IsOpen = false;
+        };
+
         TitleBar.PointerPressed += OnTitleBarPointerPressed;
+        TitleBar.DoubleTapped += OnTitleBarDoubleTapped;
+        MinimizeButton.Click += (_, _) => WindowState = WindowState.Minimized;
+        MaximizeButton.Click += (_, _) => ToggleMaximized();
+        CloseButton.Click += (_, _) => Close();
+        Opened += (_, _) =>
+        {
+            // Some compositors ignore the initial maximized state while a
+            // frameless native window is still being created.
+            if (WindowState == WindowState.Normal)
+            {
+                WindowState = WindowState.Maximized;
+            }
+
+            UpdateWindowChromeState();
+        };
+        UpdateWindowChromeState();
         GameList.SelectionChanged += (_, _) => UpdateSelectedGame();
         GameList.DoubleTapped += (_, _) => LaunchSelected();
         SearchBox.TextChanged += (_, _) => RefreshVisibleGames();
         ConsoleSearchBox.TextChanged += (_, _) => RefreshVisibleConsoleLines();
         AddFolderButton.Click += async (_, _) => await AddFolderAsync();
         EmptyAddFolderButton.Click += async (_, _) => await AddFolderAsync();
-        RescanButton.Click += async (_, _) => await RescanLibraryAsync();
         OpenFileButton.Click += async (_, _) => await OpenFileAsync();
         LaunchButton.Click += (_, _) => LaunchSelected();
-        StopButton.Click += (_, _) => _emulator?.Stop();
         ClearLogButton.Click += (_, _) => { _consoleLines.Clear(); _allConsoleLines.Clear(); };
         StopButton.Click += (_, _) => StopEmulator();
-        ClearLogButton.Click += (_, _) => _consoleLines.Clear();
         CopyLogButton.Click += async (_, _) => await CopyConsoleAsync();
         DetachConsoleButton.Click += (_, _) => ShowConsoleWindow();
         LibraryTabButton.Click += (_, _) => SetActivePage(0);
@@ -111,6 +241,18 @@ public partial class MainWindow : Window
         // it is open already uses the new values.
         LogLevelBox.SelectionChanged += (_, _) => _settings.LogLevel = SelectedLogLevel();
         TraceImportsBox.ValueChanged += (_, _) => _settings.ImportTraceLimit = (int)(TraceImportsBox.Value ?? 0);
+        RenderResolutionBox.SelectionChanged += (_, _) =>
+        {
+            if (RenderResolutionBox.SelectedItem is LocalizedChoice { Value: var value } &&
+                double.TryParse(
+                    value,
+                    System.Globalization.NumberStyles.Float,
+                    System.Globalization.CultureInfo.InvariantCulture,
+                    out var scale))
+            {
+                _settings.RenderResolutionScale = scale;
+            }
+        };
         StrictToggle.IsCheckedChanged += (_, _) => _settings.StrictDynlibResolution = StrictToggle.IsChecked == true;
         LogToFileToggle.IsCheckedChanged += (_, _) => _settings.LogToFile = LogToFileToggle.IsChecked == true;
         OverrideLogFileToggle.IsCheckedChanged += (_, _) =>
@@ -125,35 +267,58 @@ public partial class MainWindow : Window
             _settings.DiscordRichPresence = DiscordToggle.IsChecked == true;
             UpdateDiscordPresence();
         };
+        AutoUpdateToggle.IsCheckedChanged += (_, _) =>
+            _settings.CheckForUpdatesOnStartup = AutoUpdateToggle.IsChecked == true;
+        UpdateReminderToggle.IsCheckedChanged += (_, _) =>
+            _settings.ShowUpdateNotifications = UpdateReminderToggle.IsChecked == true;
+        WindowModeBox.SelectionChanged += (_, _) => _settings.WindowMode = SelectedComboText(WindowModeBox, "Windowed");
+        DisplayBox.SelectionChanged += (_, _) => OnHostDisplayChanged();
+        ResolutionBox.SelectionChanged += (_, _) => OnHostResolutionChanged();
+        RefreshRateBox.SelectionChanged += (_, _) => OnHostRefreshRateChanged();
+        ScalingModeBox.SelectionChanged += (_, _) => _settings.ScalingMode = SelectedComboText(ScalingModeBox, "Fit");
+        VSyncToggle.IsCheckedChanged += (_, _) => _settings.VSync = VSyncToggle.IsChecked == true;
+        HdrModeBox.SelectionChanged += (_, _) => _settings.HdrMode = SelectedComboText(HdrModeBox, "Auto");
+        UpdateButton.Click += async (_, _) => await OnUpdateButtonAsync();
         SelectLogFilePathButton.Click += async (_, _) => await SelectLogFilePathAsync();
         EnvBthidToggle.IsCheckedChanged += (_, _) =>
             SetEnvironmentToggle("SHARPEMU_BTHID_UNAVAILABLE", EnvBthidToggle.IsChecked == true);
         EnvLoopGuardToggle.IsCheckedChanged += (_, _) =>
             SetEnvironmentToggle("SHARPEMU_DISABLE_IMPORT_LOOP_GUARD", EnvLoopGuardToggle.IsChecked == true);
+        EnvWritableApp0Toggle.IsCheckedChanged += (_, _) =>
+            SetEnvironmentToggle("SHARPEMU_WRITABLE_APP0", EnvWritableApp0Toggle.IsChecked == true);
         EnvVkValidationToggle.IsCheckedChanged += (_, _) =>
             SetEnvironmentToggle("SHARPEMU_VK_VALIDATION", EnvVkValidationToggle.IsChecked == true);
         EnvDumpSpirvToggle.IsCheckedChanged += (_, _) =>
             SetEnvironmentToggle("SHARPEMU_DUMP_SPIRV", EnvDumpSpirvToggle.IsChecked == true);
         EnvLogDirectMemoryToggle.IsCheckedChanged += (_, _) =>
             SetEnvironmentToggle("SHARPEMU_LOG_DIRECT_MEMORY", EnvLogDirectMemoryToggle.IsChecked == true);
+        EnvLogIoToggle.IsCheckedChanged += (_, _) =>
+            SetEnvironmentToggle("SHARPEMU_LOG_IO", EnvLogIoToggle.IsChecked == true);
         EnvLogNpToggle.IsCheckedChanged += (_, _) =>
             SetEnvironmentToggle("SHARPEMU_LOG_NP", EnvLogNpToggle.IsChecked == true);
+        EnvGuestImageCpuSyncToggle.IsCheckedChanged += (_, _) =>
+            SetEnvironmentToggle(
+                "SHARPEMU_GUEST_IMAGE_CPU_SYNC",
+                EnvGuestImageCpuSyncToggle.IsChecked == true);
+        DefaultProfileBox.TextChanged += (_, _) =>
+            _settings.DefaultProfile = GuiSettings.NormalizeDefaultProfile(DefaultProfileBox.Text);
         LanguageBox.SelectionChanged += (_, _) => OnLanguageChanged();
 
         GameList.AddHandler(ContextRequestedEvent, OnGameContextRequested, RoutingStrategies.Tunnel);
+        AddHandler(KeyDownEvent, OnPreviewKeyDown, RoutingStrategies.Tunnel);
         CtxLaunch.Click += (_, _) => LaunchSelected();
         CtxOpenFolder.Click += (_, _) => OpenSelectedGameFolder();
         CtxCopyPath.Click += async (_, _) =>
             await CopyToClipboardAsync((GameList.SelectedItem as GameEntry)?.Path, "Clipboard.Path");
         CtxCopyTitleId.Click += async (_, _) =>
             await CopyToClipboardAsync((GameList.SelectedItem as GameEntry)?.TitleId, "Clipboard.TitleId");
+        CtxGameSettings.Click += (_, _) => OpenSelectedGameSettings();
         CtxRemove.Click += (_, _) => RemoveSelectedFromLibrary();
 
         Opened += async (_, _) => await OnOpenedAsync();
         Closing += (_, _) => OnWindowClosing();
 
-        WindowsDualSenseReader.EnsureStarted();
-        WindowsXInputReader.EnsureStarted();
+        SdlLauncherGamepad.EnsureStarted();
         _gamepadTimer = new DispatcherTimer
         {
             Interval = TimeSpan.FromMilliseconds(50),
@@ -166,16 +331,22 @@ public partial class MainWindow : Window
         {
             Process.Start(new ProcessStartInfo
             {
-                FileName = "https://github.com/par274/sharpemu",
+                FileName = "https://github.com/sharpemu/sharpemu",
                 UseShellExecute = true
             });
         };
 
-        DiscordButton.Click += (_, _) =>
+        LatestCommitHashText.Click += (_, _) =>
         {
+            if (string.IsNullOrWhiteSpace(_latestCommitSha))
+            {
+                return;
+            }
+
             Process.Start(new ProcessStartInfo
             {
-                FileName = "https://discord.com/invite/6GejPEDqpc",
+                FileName =
+                    $"https://github.com/sharpemu/sharpemu/commit/{_latestCommitSha}",
                 UseShellExecute = true
             });
         };
@@ -220,12 +391,96 @@ public partial class MainWindow : Window
         }
     }
 
+    // ---- Github http client config ----
+    // This is for getting lash commit id
+    private static HttpClient CreateGithubHttpClient()
+    {
+        var client = new HttpClient
+        {
+            Timeout = TimeSpan.FromSeconds(15)
+        };
+
+        client.DefaultRequestHeaders.UserAgent.ParseAdd("SharpEmu/1.0");
+        client.DefaultRequestHeaders.Accept.Add(
+            new MediaTypeWithQualityHeaderValue("application/vnd.github.sha"));
+
+        client.DefaultRequestHeaders.Add(
+            "X-GitHub-Api-Version",
+            "2026-03-10");
+
+        return client;
+    }
+    private async Task LoadLatestCommitAsync()
+    {
+        const string apiUrl =
+            "https://api.github.com/repos/sharpemu/sharpemu/commits/main";
+
+        _latestCommitSha = null;
+        LatestCommitHashText.Content = "Loading…";
+        LatestCommitHashText.IsEnabled = false;
+
+        try
+        {
+            using var response = await GithubHttpClient.GetAsync(apiUrl);
+            var responseBody =
+                (await response.Content.ReadAsStringAsync()).Trim();
+
+            if (!response.IsSuccessStatusCode)
+            {
+                LatestCommitHashText.Content =
+                    $"HTTP {(int)response.StatusCode}";
+
+                ToolTip.SetTip(
+                    LatestCommitHashText,
+                    string.IsNullOrWhiteSpace(responseBody)
+                        ? response.ReasonPhrase
+                        : responseBody);
+
+                return;
+            }
+
+            if (responseBody.Length < 7)
+            {
+                LatestCommitHashText.Content = "Invalid response";
+                ToolTip.SetTip(LatestCommitHashText, responseBody);
+                return;
+            }
+
+            // Keep the complete SHA for the URL.
+            _latestCommitSha = responseBody;
+
+            // Display only the short SHA.
+            LatestCommitHashText.Content =
+                responseBody[..Math.Min(7, responseBody.Length)];
+
+            LatestCommitHashText.IsEnabled = true;
+
+            ToolTip.SetTip(
+                LatestCommitHashText,
+                $"Open commit {_latestCommitSha}");
+        }
+        catch (TaskCanceledException ex)
+        {
+            LatestCommitHashText.Content = "Timeout";
+            ToolTip.SetTip(LatestCommitHashText, ex.Message);
+        }
+        catch (HttpRequestException ex)
+        {
+            LatestCommitHashText.Content = "Connection error";
+            ToolTip.SetTip(LatestCommitHashText, ex.Message);
+        }
+        catch (Exception ex)
+        {
+            LatestCommitHashText.Content = "Error";
+            ToolTip.SetTip(LatestCommitHashText, ex.Message);
+        }
+    }
+
     // ---- Controller navigation ----
 
     private void PollGamepad()
     {
-        // DualSense wins when both are connected; XInput covers Xbox pads.
-        if (!WindowsDualSenseReader.TryGetState(out var pad) && !WindowsXInputReader.TryGetState(out pad))
+        if (!SdlLauncherGamepad.TryGetState(out var pad))
         {
             _previousPadButtons = HostGamepadButtons.None;
             return;
@@ -235,6 +490,14 @@ public partial class MainWindow : Window
         {
             // Ignore input while the launcher is in the background, e.g. the
             // game window is focused and using the same controller.
+            _previousPadButtons = pad.Buttons;
+            return;
+        }
+
+        if (_isRunning || _isStopping)
+        {
+            // The controller belongs to the separate game window while a
+            // session is active; Circle/B must never stop the session.
             _previousPadButtons = pad.Buttons;
             return;
         }
@@ -286,11 +549,6 @@ public partial class MainWindow : Window
         if ((pressed & HostGamepadButtons.Cross) != 0)
         {
             LaunchSelected();
-        }
-
-        if ((pressed & HostGamepadButtons.Circle) != 0)
-        {
-            StopEmulator();
         }
 
         _previousPadButtons = pad.Buttons;
@@ -365,6 +623,12 @@ public partial class MainWindow : Window
         ApplySettingsToControls();
         LocateEmulator();
         UpdateDiscordPresence();
+        _ = LoadLatestCommitAsync();
+
+        if (_settings.CheckForUpdatesOnStartup)
+        {
+            _ = CheckForUpdatesAsync();
+        }
         await RescanLibraryAsync();
     }
 
@@ -379,7 +643,7 @@ public partial class MainWindow : Window
 
     private void OnLanguageChanged()
     {
-        if (LanguageBox.SelectedItem is not Localization.LanguageInfo language)
+        if (LanguageBox.SelectedItem is not LanguageInfo language)
         {
             return;
         }
@@ -390,108 +654,15 @@ public partial class MainWindow : Window
     }
 
     /// <summary>
-    /// Re-applies every UI string from the current language, so switching
-    /// languages in Options takes effect immediately without reopening the
-    /// window.
+    /// Recomputes localized strings that also depend on runtime state.
+    /// Static labels update automatically through XAML bindings.
     /// </summary>
     private void ApplyLocalization()
     {
-        var loc = Localization.Instance;
-
-        LibraryTabButton.Content = loc.Get("Page.Library");
-        OptionsTabButton.Content = loc.Get("Page.Options");
-
-        SearchBox.Watermark = loc.Get("Library.SearchWatermark");
-        AddFolderButton.Content = loc.Get("Library.AddFolder");
-        RescanButton.Content = loc.Get("Library.Rescan");
-        OpenFileButton.Content = loc.Get("Library.OpenFile");
-
-        CtxLaunch.Header = loc.Get("Library.Context.Launch");
-        CtxOpenFolder.Header = loc.Get("Library.Context.OpenFolder");
-        CtxCopyPath.Header = loc.Get("Library.Context.CopyPath");
-        CtxCopyTitleId.Header = loc.Get("Library.Context.CopyTitleId");
-        CtxRemove.Header = loc.Get("Library.Context.Remove");
-
-        EmptyAddFolderButton.Content = loc.Get("Library.Empty.AddFolder");
-        LoadingStateText.Text = loc.Get("Library.Loading");
-
-        GeneralTabItem.Header = loc.Get("Options.General");
-        EnvTabItem.Header = loc.Get("Options.Env.Tab");
-        EnvSectionTitle.Text = loc.Get("Options.Section.Environment");
-        EnvDesc.Text = loc.Get("Options.Env.Desc");
-        EnvBthidDesc.Text = loc.Get("Options.Env.Bthid.Desc");
-        EnvLoopGuardDesc.Text = loc.Get("Options.Env.LoopGuard.Desc");
-        EnvVkValidationDesc.Text = loc.Get("Options.Env.VkValidation.Desc");
-        EnvDumpSpirvDesc.Text = loc.Get("Options.Env.DumpSpirv.Desc");
-        EnvLogDirectMemoryDesc.Text = loc.Get("Options.Env.LogDirectMemory.Desc");
-        EnvLogNpDesc.Text = loc.Get("Options.Env.LogNp.Desc");
-        EmulationSectionTitle.Text = loc.Get("Options.Section.Emulation");
-        LoggingSectionTitle.Text = loc.Get("Options.Section.Logging");
-        LauncherSectionTitle.Text = loc.Get("Options.Section.Launcher");
-
-        CpuEngineLabel.Text = loc.Get("Options.CpuEngine.Label");
-        CpuEngineDesc.Text = loc.Get("Options.CpuEngine.Desc");
-        CpuEngineNativeItem.Content = loc.Get("Options.CpuEngine.Native");
-
-        StrictLabel.Text = loc.Get("Options.Strict.Label");
-        StrictDesc.Text = loc.Get("Options.Strict.Desc");
-
-        LogLevelLabel.Text = loc.Get("Options.LogLevel.Label");
-        LogLevelDesc.Text = loc.Get("Options.LogLevel.Desc");
-        LogLevelTraceItem.Content = loc.Get("Options.LogLevel.Trace");
-        LogLevelDebugItem.Content = loc.Get("Options.LogLevel.Debug");
-        LogLevelInfoItem.Content = loc.Get("Options.LogLevel.Info");
-        LogLevelWarningItem.Content = loc.Get("Options.LogLevel.Warning");
-        LogLevelErrorItem.Content = loc.Get("Options.LogLevel.Error");
-        LogLevelCriticalItem.Content = loc.Get("Options.LogLevel.Critical");
-
-        TraceImportsLabel.Text = loc.Get("Options.TraceImports.Label");
-        TraceImportsDesc.Text = loc.Get("Options.TraceImports.Desc");
-
-        LogToFileLabel.Text = loc.Get("Options.LogToFile.Label");
-        LogToFileDesc.Text = loc.Get("Options.LogToFile.Desc");
-
-        LogFilePathLabel.Text = loc.Get("Options.LogFilePath.Label");
-        SelectLogFilePathButton.Content = loc.Get("Options.LogFilePath.Select");
+        RefreshLocalizedChoices();
         UpdateLogFilePathText();
-
-        OverrideLogFileLabel.Text = loc.Get("Options.OverrideLogFile.Label");
-        OverrideLogFileDesc.Text = loc.Get("Options.OverrideLogFile.Desc");
-
-        LanguageLabel.Text = loc.Get("Options.Language.Label");
-        LanguageDesc.Text = loc.Get("Options.Language.Desc");
-
-        TitleMusicLabel.Text = loc.Get("Options.TitleMusic.Label");
-        TitleMusicDesc.Text = loc.Get("Options.TitleMusic.Desc");
-
-        DiscordLabel.Text = loc.Get("Options.Discord.Label");
-        DiscordDesc.Text = loc.Get("Options.Discord.Desc");
-
-        foreach (var toggle in new[] { StrictToggle, LogToFileToggle, OverrideLogFileToggle, TitleMusicToggle, DiscordToggle })
-        {
-            toggle.OnContent = loc.Get("Common.On");
-            toggle.OffContent = loc.Get("Common.Off");
-        }
-
-        ConsoleSectionTitle.Text = loc.Get("Console.Title");
-        ConsoleSearchBox.Watermark = loc.Get("Console.SearchWatermark");
-        AutoScrollCheck.Content = loc.Get("Console.AutoScroll");
-        DetachConsoleButton.Content = loc.Get("Console.Split");
-        CopyLogButton.Content = loc.Get("Console.Copy");
-        ClearLogButton.Content = loc.Get("Console.Clear");
-
-        ConsoleToggle.Content = loc.Get("Launch.Console");
-        LaunchButton.Content = loc.Get("Launch.Launch");
-        StopButton.Content = loc.Get("Launch.Stop");
-
-        AboutSectionTitle.Text = loc.Get("Options.About");
-        GithubLabel.Text = loc.Get("About.Github.Label");
-        GithubDesc.Text = loc.Get("About.Github.Desc");
-        DiscordServerLabel.Text = loc.Get("About.Discord.Label");
-        DiscordServerDesc.Text = loc.Get("About.Discord.Desc");
-        GithubButton.Content = loc.Get("About.GithubButton");
-        DiscordButton.Content = loc.Get("About.DiscordButton");
-
+        RefreshHostRefreshRates(_settings.RefreshRate);
+        RefreshUpdateText();
         UpdateEmptyStateTexts();
         UpdateSelectedGameTexts();
     }
@@ -536,60 +707,152 @@ public partial class MainWindow : Window
 
     private void OnKeyDown(object sender, KeyEventArgs args)
     {
-        args.Handled = true;
-        switch (args.Key)
+        if (args.Key == Key.F11 && !_isRunning)
         {
-            case Key.F11:
-                OnWindowFullScreen(this, new RoutedEventArgs());
-                break;
-            default:
-                args.Handled = false;
-                break;
+            WindowState = WindowState == WindowState.FullScreen
+                ? WindowState.Maximized
+                : WindowState.FullScreen;
+            args.Handled = true;
         }
     }
 
-    private void OnWindowFullScreen(object sender, RoutedEventArgs args)
+    private void OnPreviewKeyDown(object? sender, KeyEventArgs args)
     {
-        if (WindowState == WindowState.FullScreen)
-        {
-            WindowState = WindowState.Normal;
-            ExtendClientAreaChromeHints = ExtendClientAreaChromeHints.PreferSystemChrome;
-            TitleBar.IsVisible = true;
-            StatusBar.IsVisible = true;
-        }
-        else
-        {
-            WindowState = WindowState.FullScreen;
-            ExtendClientAreaChromeHints = ExtendClientAreaChromeHints.NoChrome;
-            TitleBar.IsVisible = false;
-            StatusBar.IsVisible = false;
-        }
+        // The session runs in its own SDL window and takes keyboard focus with
+        // it, so launcher buttons no longer see game input and nothing has to
+        // be swallowed here. Kept as the wired handler because the launcher
+        // still needs a preview hook for its own shortcuts.
     }
 
     private void OnWindowClosing()
     {
+        _isClosing = true;
+        Interlocked.Increment(ref _libraryScanGeneration);
+        Interlocked.Increment(ref _detailLoadGeneration);
+        _libraryWatcher.Dispose();
         _settings.Save();
         _consoleFlushTimer.Stop();
+        _libraryBlurTimer.Stop();
         _gamepadTimer.Stop();
+        SdlLauncherGamepad.Shutdown();
         _sndPreview.Stop();
         _discord?.Dispose();
         _consoleWindow?.Close();
         _emulator?.Dispose();
+        _consoleMirror?.Dispose();
         DropFileLog();
     }
 
     private void OnTitleBarPointerPressed(object? sender, PointerPressedEventArgs e)
     {
-        if (e.GetCurrentPoint(this).Properties.IsLeftButtonPressed)
+        if (e.Source is Visual source &&
+            source.FindAncestorOfType<Button>(includeSelf: true) is null &&
+            e.GetCurrentPoint(this).Properties.IsLeftButtonPressed)
         {
             BeginMoveDrag(e);
         }
     }
 
+    private void OnTitleBarDoubleTapped(object? sender, TappedEventArgs e)
+    {
+        if (e.Source is Visual source &&
+            source.FindAncestorOfType<Button>(includeSelf: true) is null)
+        {
+            ToggleMaximized();
+            e.Handled = true;
+        }
+    }
+
+    private void ToggleMaximized()
+    {
+        WindowState = WindowState == WindowState.Maximized
+            ? WindowState.Normal
+            : WindowState.Maximized;
+    }
+
+    private void UpdateMaximizeButton()
+    {
+        if (MaximizeGlyph is not { } glyph || MaximizeButton is not { } button)
+        {
+            return;
+        }
+
+        var isMaximized = WindowState == WindowState.Maximized;
+        glyph.Text = isMaximized ? "❐" : "□";
+        ToolTip.SetTip(button, isMaximized ? "Restore" : "Maximize");
+        AutomationProperties.SetName(
+            button,
+            isMaximized ? "Restore window" : "Maximize window");
+    }
+
+    private void UpdateWindowChromeState()
+    {
+        UpdateMaximizeButton();
+        var isFullscreen = WindowState == WindowState.FullScreen;
+
+        if (TitleBar is { } titleBar)
+        {
+            titleBar.IsVisible = !isFullscreen;
+        }
+
+        if (StatusBar is { } statusBar)
+        {
+            statusBar.IsVisible = !isFullscreen;
+        }
+
+        if (ResizeHandles is { } handles)
+        {
+            handles.IsVisible = CanResize && WindowState == WindowState.Normal;
+        }
+    }
+
+    private void OnResizeHandlePointerPressed(object? sender, PointerPressedEventArgs e)
+    {
+        if (WindowState != WindowState.Normal ||
+            !e.GetCurrentPoint(this).Properties.IsLeftButtonPressed ||
+            sender is not Control { Tag: string edgeName } ||
+            !Enum.TryParse<WindowEdge>(edgeName, out var edge))
+        {
+            return;
+        }
+
+        BeginResizeDrag(edge, e);
+        e.Handled = true;
+    }
+
     // ---- Settings ----
+
+    private void InitializeLocalizedChoiceBoxes()
+    {
+        CpuEngineBox.ItemsSource = _cpuEngineChoices;
+        LogLevelBox.ItemsSource = _logLevelChoices;
+        RenderResolutionBox.ItemsSource = _renderResolutionChoices;
+        WindowModeBox.ItemsSource = _windowModeChoices;
+        ScalingModeBox.ItemsSource = _scalingModeChoices;
+        HdrModeBox.ItemsSource = _hdrModeChoices;
+    }
+
+    private void RefreshLocalizedChoices()
+    {
+        RefreshChoices(_cpuEngineChoices);
+        RefreshChoices(_logLevelChoices);
+        RefreshChoices(_renderResolutionChoices);
+        RefreshChoices(_windowModeChoices);
+        RefreshChoices(_scalingModeChoices);
+        RefreshChoices(_hdrModeChoices);
+    }
+
+    private static void RefreshChoices(IEnumerable<LocalizedChoice> choices)
+    {
+        foreach (var choice in choices)
+        {
+            choice.Refresh(Localization.Instance);
+        }
+    }
 
     private void ApplySettingsToControls()
     {
+        CpuEngineBox.SelectedIndex = 0;
         LogLevelBox.SelectedIndex = _settings.LogLevel.ToLowerInvariant() switch
         {
             "trace" => 0,
@@ -601,18 +864,277 @@ public partial class MainWindow : Window
             _ => 2,
         };
         TraceImportsBox.Value = Math.Clamp(_settings.ImportTraceLimit, 0, 4096);
+        RenderResolutionBox.SelectedIndex = _settings.RenderResolutionScale switch
+        {
+            >= 0.875 => 0,
+            >= 0.625 => 1,
+            >= 0.375 => 2,
+            _ => 3,
+        };
         StrictToggle.IsChecked = _settings.StrictDynlibResolution;
         LogToFileToggle.IsChecked = _settings.LogToFile;
         OverrideLogFileToggle.IsChecked = _settings.OverrideLogFile;
         TitleMusicToggle.IsChecked = _settings.PlayTitleMusic;
         DiscordToggle.IsChecked = _settings.DiscordRichPresence;
+        AutoUpdateToggle.IsChecked = _settings.CheckForUpdatesOnStartup;
+        UpdateReminderToggle.IsChecked = _settings.ShowUpdateNotifications;
         EnvBthidToggle.IsChecked = _settings.EnvironmentToggles.Contains("SHARPEMU_BTHID_UNAVAILABLE");
         EnvLoopGuardToggle.IsChecked = _settings.EnvironmentToggles.Contains("SHARPEMU_DISABLE_IMPORT_LOOP_GUARD");
+        EnvWritableApp0Toggle.IsChecked = _settings.EnvironmentToggles.Contains("SHARPEMU_WRITABLE_APP0");
         EnvVkValidationToggle.IsChecked = _settings.EnvironmentToggles.Contains("SHARPEMU_VK_VALIDATION");
         EnvDumpSpirvToggle.IsChecked = _settings.EnvironmentToggles.Contains("SHARPEMU_DUMP_SPIRV");
         EnvLogDirectMemoryToggle.IsChecked = _settings.EnvironmentToggles.Contains("SHARPEMU_LOG_DIRECT_MEMORY");
+        EnvLogIoToggle.IsChecked = _settings.EnvironmentToggles.Contains("SHARPEMU_LOG_IO");
         EnvLogNpToggle.IsChecked = _settings.EnvironmentToggles.Contains("SHARPEMU_LOG_NP");
+        EnvGuestImageCpuSyncToggle.IsChecked =
+            _settings.EnvironmentToggles.Contains("SHARPEMU_GUEST_IMAGE_CPU_SYNC");
+        DefaultProfileBox.Text = _settings.DefaultProfile;
+        WindowModeBox.SelectedIndex = ChoiceIndex(_settings.WindowMode, "Windowed", "Borderless", "Exclusive");
+        LoadHostDisplayOptions();
+        ScalingModeBox.SelectedIndex = ChoiceIndex(_settings.ScalingMode, "Fit", "Cover", "Stretch", "Integer");
+        VSyncToggle.IsChecked = _settings.VSync;
+        HdrModeBox.SelectedIndex = ChoiceIndex(_settings.HdrMode, "Auto", "On", "Off");
         UpdateLogFilePathText();
+    }
+
+    private static string SelectedComboText(ComboBox comboBox, string fallback) =>
+        comboBox.SelectedItem switch
+        {
+            LocalizedChoice { Value: var value } => value,
+            string value => value,
+            _ => fallback,
+        };
+
+    private void LoadHostDisplayOptions()
+    {
+        _updatingHostDisplayOptions = true;
+        try
+        {
+            _hostDisplays = HostDisplayOptions.BuildDisplays(
+                HostDisplayCatalog.Query(),
+                _settings.DisplayIndex);
+            DisplayBox.ItemsSource = _hostDisplays;
+            var display = HostDisplayOptions.SelectDisplay(_hostDisplays, _settings.DisplayIndex);
+            DisplayBox.SelectedItem = display;
+            PopulateHostModes(display, _settings.Resolution, _settings.RefreshRate);
+        }
+        finally
+        {
+            _updatingHostDisplayOptions = false;
+        }
+
+        SyncHostVideoSettings();
+    }
+
+    private void OnHostDisplayChanged()
+    {
+        if (_updatingHostDisplayOptions || DisplayBox.SelectedItem is not HostDisplayOption display)
+        {
+            return;
+        }
+
+        _updatingHostDisplayOptions = true;
+        try
+        {
+            PopulateHostModes(display, _settings.Resolution, _settings.RefreshRate);
+        }
+        finally
+        {
+            _updatingHostDisplayOptions = false;
+        }
+
+        SyncHostVideoSettings();
+    }
+
+    private void OnHostResolutionChanged()
+    {
+        if (_updatingHostDisplayOptions || DisplayBox.SelectedItem is not HostDisplayOption)
+        {
+            return;
+        }
+
+        _settings.Resolution = SelectedComboText(ResolutionBox, "1920x1080");
+        RefreshHostRefreshRates(_settings.RefreshRate);
+        OnHostRefreshRateChanged();
+    }
+
+    private void OnHostRefreshRateChanged()
+    {
+        if (!_updatingHostDisplayOptions && RefreshRateBox.SelectedItem is HostRefreshRateOption refreshRate)
+        {
+            _settings.RefreshRate = refreshRate.Value;
+        }
+    }
+
+    private void PopulateHostModes(
+        HostDisplayOption display,
+        string selectedResolution,
+        int selectedRefreshRate)
+    {
+        var resolutions = HostDisplayOptions.BuildResolutions(display, selectedResolution);
+        ResolutionBox.ItemsSource = resolutions;
+        ResolutionBox.SelectedItem = resolutions.FirstOrDefault(resolution =>
+            string.Equals(resolution, selectedResolution, StringComparison.OrdinalIgnoreCase)) ?? resolutions[0];
+        RefreshHostRefreshRates(selectedRefreshRate);
+    }
+
+    private void RefreshHostRefreshRates(int selectedRefreshRate)
+    {
+        if (DisplayBox.SelectedItem is not HostDisplayOption display)
+        {
+            return;
+        }
+
+        var wasUpdating = _updatingHostDisplayOptions;
+        _updatingHostDisplayOptions = true;
+        try
+        {
+            var rates = HostDisplayOptions.BuildRefreshRates(
+                display,
+                SelectedComboText(ResolutionBox, _settings.Resolution),
+                selectedRefreshRate,
+                Localization.Instance.Get("Options.RefreshRate.Automatic"));
+            RefreshRateBox.ItemsSource = rates;
+            RefreshRateBox.SelectedItem = rates.FirstOrDefault(rate => rate.Value == selectedRefreshRate) ?? rates[0];
+        }
+        finally
+        {
+            _updatingHostDisplayOptions = wasUpdating;
+        }
+    }
+
+    private void SyncHostVideoSettings()
+    {
+        if (DisplayBox.SelectedItem is HostDisplayOption display)
+        {
+            _settings.DisplayIndex = display.Index;
+        }
+
+        _settings.Resolution = SelectedComboText(ResolutionBox, "1920x1080");
+        _settings.RefreshRate = RefreshRateBox.SelectedItem is HostRefreshRateOption refreshRate
+            ? refreshRate.Value
+            : 0;
+    }
+
+    private static int ChoiceIndex(string value, params string[] choices)
+    {
+        var index = Array.FindIndex(choices, choice => string.Equals(choice, value, StringComparison.OrdinalIgnoreCase));
+        return index < 0 ? 0 : index;
+    }
+
+    private async Task OnUpdateButtonAsync()
+    {
+        if (_availableUpdate is null)
+        {
+            await CheckForUpdatesAsync(forcePrompt: true);
+            return;
+        }
+
+        await ShowUpdateDialogAsync();
+    }
+
+    private async Task DownloadAvailableUpdateAsync(Updater.UpdateInfo update)
+    {
+        UpdateButton.IsEnabled = false;
+        try
+        {
+            var progress = new Progress<int>(value =>
+                SetUpdateStatus("Updater.Status.Downloading", value));
+            await Updater.DownloadAndRestartAsync(update, progress);
+            SetUpdateStatus("Updater.Status.Installing");
+            Close();
+        }
+        catch (InvalidDataException)
+        {
+            SetUpdateStatus("Updater.Status.ChecksumFailed");
+            UpdateButton.IsEnabled = true;
+        }
+        catch
+        {
+            SetUpdateStatus("Updater.Status.Failed");
+            UpdateButton.IsEnabled = true;
+        }
+    }
+
+    private async Task CheckForUpdatesAsync(bool forcePrompt = false)
+    {
+        _availableUpdate = null;
+        UpdateButton.IsEnabled = false;
+        SetUpdateStatus("Updater.Status.Checking");
+        try
+        {
+            _availableUpdate = await Updater.CheckAsync(BuildInfo.CommitSha);
+            SetUpdateStatus(
+                _availableUpdate is null ? "Updater.Status.Current" : "Updater.Status.Available",
+                _availableUpdate?.Sha ?? BuildInfo.CommitSha ?? "dev");
+            if (_availableUpdate is not null && (forcePrompt || _settings.ShowUpdateNotifications))
+            {
+                await ShowUpdateDialogAsync();
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            SetUpdateStatus("Updater.Status.Timeout");
+        }
+        catch (PlatformNotSupportedException)
+        {
+            SetUpdateStatus("Updater.Status.Unsupported");
+        }
+        catch (Updater.RateLimitException)
+        {
+            SetUpdateStatus("Updater.Status.RateLimited");
+        }
+        catch
+        {
+            SetUpdateStatus("Updater.Status.Failed");
+        }
+        finally
+        {
+            UpdateButton.IsEnabled = true;
+            RefreshUpdateText();
+        }
+    }
+
+    private async Task ShowUpdateDialogAsync()
+    {
+        if (_availableUpdate is null)
+        {
+            return;
+        }
+
+        var result = await new UpdateDialog(_availableUpdate).ShowDialog<UpdateDialog.Result?>(this);
+        if (result is null)
+        {
+            return;
+        }
+
+        if (result.SuppressReminder)
+        {
+            _settings.ShowUpdateNotifications = false;
+            UpdateReminderToggle.IsChecked = false;
+            _settings.Save();
+        }
+
+        if (result.Download)
+        {
+            await DownloadAvailableUpdateAsync(_availableUpdate);
+        }
+    }
+
+    private void SetUpdateStatus(string key, params object?[] args)
+    {
+        _updateStatusKey = key;
+        _updateStatusArgs = args;
+        RefreshUpdateText();
+    }
+
+    private void RefreshUpdateText()
+    {
+        UpdateStatusText.Text = Localization.Instance.Format(_updateStatusKey, _updateStatusArgs);
+        // Keep this action as an explicit check even when notifications are
+        // suppressed and an update is already cached; the update dialog owns
+        // the actual download/restart action.
+        UpdateButton.Content = Localization.Instance.Get("Updater.Check");
     }
 
     // Environment variables set on this process at the previous launch; children
@@ -634,6 +1156,8 @@ public partial class MainWindow : Window
         }
     }
 
+    private const string DefaultProfileEnvironmentName = "SHARPEMU_DEFAULT_PROFILE";
+
     private string SelectedLogLevel()
     {
         return LogLevelBox.SelectedIndex switch
@@ -650,7 +1174,7 @@ public partial class MainWindow : Window
 
     private void UpdateLogFilePathText()
     {
-        LogFilePathText.Text = string.IsNullOrWhiteSpace(_settings.LogFilePath)
+        LogFilePathRow.Description = string.IsNullOrWhiteSpace(_settings.LogFilePath)
             ? Localization.Instance.Get("Options.LogFilePath.Default")
             : _settings.LogFilePath;
     }
@@ -689,8 +1213,8 @@ public partial class MainWindow : Window
             candidates.Add(_settings.EmulatorPath);
         }
 
-        // The GUI and the CLI are the same executable: with arguments it runs
-        // the emulator, so the preferred child process is this process itself.
+        // The GUI and CLI share one executable. The selected path is the
+        // isolated child executable and also defines the portable data root.
         if (Environment.ProcessPath is { } selfPath &&
             Path.GetFileNameWithoutExtension(selfPath).Equals("SharpEmu", StringComparison.OrdinalIgnoreCase))
         {
@@ -727,7 +1251,7 @@ public partial class MainWindow : Window
         }
 
         var changed = false;
-        if (!_settings.GameFolders.Contains(path, StringComparer.OrdinalIgnoreCase))
+        if (!_settings.GameFolders.Contains(path, GameLibraryPath.Comparer))
         {
             _settings.GameFolders.Add(path);
             changed = true;
@@ -737,7 +1261,7 @@ public partial class MainWindow : Window
         // games beneath it that were removed from the library earlier.
         var prefix = Path.TrimEndingDirectorySeparator(path) + Path.DirectorySeparatorChar;
         changed |= _settings.ExcludedGames.RemoveAll(excluded =>
-            excluded.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)) > 0;
+            excluded.StartsWith(prefix, GameLibraryPath.Comparison)) > 0;
 
         if (changed)
         {
@@ -747,25 +1271,72 @@ public partial class MainWindow : Window
         await RescanLibraryAsync();
     }
 
-    private async Task RescanLibraryAsync()
+    private void OnLibraryRefreshRequested(object? sender, EventArgs args)
     {
+        Dispatcher.UIThread.Post(
+            () =>
+            {
+                if (!_isClosing)
+                {
+                    _ = RescanLibraryFromWatcherAsync();
+                }
+            },
+            DispatcherPriority.Background);
+    }
+
+    private async Task RescanLibraryFromWatcherAsync()
+    {
+        try
+        {
+            await RescanLibraryAsync(showProgress: false);
+        }
+        catch (Exception exception)
+        {
+            Console.Error.WriteLine(
+                $"[GUI][WARN] Automatic library refresh failed: {exception.Message}");
+        }
+    }
+
+    private async Task RescanLibraryAsync(bool showProgress = true)
+    {
+        Dispatcher.UIThread.VerifyAccess();
+
+        var scanGeneration = Interlocked.Increment(ref _libraryScanGeneration);
         var folders = _settings.GameFolders.ToArray();
-        var excluded = new HashSet<string>(_settings.ExcludedGames, StringComparer.OrdinalIgnoreCase);
-        StatusBarRight.Text = Localization.Instance.Get("Status.ScanningLibrary");
-        EmptyState.IsVisible = false;
-        LoadingState.IsVisible = true;
+        var excluded = new HashSet<string>(_settings.ExcludedGames, GameLibraryPath.Comparer);
+        _libraryWatcher.Watch(folders);
+        var showLoadingState = showProgress && _allGames.Count == 0;
+        if (showProgress)
+        {
+            StatusBarRight.Text = Localization.Instance.Get("Status.ScanningLibrary");
+        }
+
+        if (showLoadingState)
+        {
+            EmptyState.IsVisible = false;
+            LoadingState.IsVisible = true;
+        }
 
         var games = await Task.Run(() => ScanFolders(folders, excluded));
+        if (_isClosing || scanGeneration != Volatile.Read(ref _libraryScanGeneration))
+        {
+            return;
+        }
 
+        Dispatcher.UIThread.VerifyAccess();
+        var reconciliation = GameLibraryReconciler.Reconcile(_allGames, games);
         _allGames.Clear();
-        _allGames.AddRange(games);
-        RefreshVisibleGames();
+        _allGames.AddRange(reconciliation.Games);
+        RefreshVisibleGames(reconciliation.BackgroundsChanged);
         LoadingState.IsVisible = false;
-        LoadGameDetailsInBackground(games);
+        LoadGameDetailsInBackground(reconciliation.CoversToLoad, reconciliation.Games);
         UpdateDiscordPresence();
-        StatusBarRight.Text = folders.Length == 0
-            ? Localization.Instance.Get("Status.AddFolderPrompt")
-            : Localization.Instance.Format("Status.LibraryScanned", games.Count, folders.Length);
+        if (showProgress)
+        {
+            StatusBarRight.Text = folders.Length == 0
+                ? Localization.Instance.Get("Status.AddFolderPrompt")
+                : Localization.Instance.Format("Status.LibraryScanned", games.Count, folders.Length);
+        }
     }
 
     /// <summary>
@@ -773,44 +1344,57 @@ public partial class MainWindow : Window
     /// game's install folder size — posting results back as they become
     /// ready. A newer scan invalidates older loads.
     /// </summary>
-    private void LoadGameDetailsInBackground(IReadOnlyList<GameEntry> games)
+    private void LoadGameDetailsInBackground(
+        IReadOnlyList<GameEntry> coversToLoad,
+        IReadOnlyList<GameEntry> gamesToMeasure)
     {
         var generation = ++_detailLoadGeneration;
         _ = Task.Run(() =>
         {
             // Covers first: they are cheap and the most visible, so the grid
             // fills with art before the (potentially slow) size pass runs.
-            foreach (var game in games)
+            foreach (var game in coversToLoad)
             {
                 if (generation != _detailLoadGeneration)
                 {
                     return;
                 }
 
-                if (game.CoverPath is null)
+                var requestedCoverPath = game.CoverPath;
+                if (requestedCoverPath is null)
                 {
                     continue;
                 }
 
                 try
                 {
-                    using var stream = File.OpenRead(game.CoverPath);
+                    using var stream = File.OpenRead(requestedCoverPath);
                     var bitmap = Bitmap.DecodeToWidth(stream, 312);
                     Dispatcher.UIThread.Post(() =>
                     {
-                        if (generation == _detailLoadGeneration)
+                        if (generation == _detailLoadGeneration
+                            && _allGames.Contains(game)
+                            && string.Equals(
+                                game.CoverPath,
+                                requestedCoverPath,
+                                StringComparison.Ordinal))
                         {
                             game.Cover = bitmap;
                         }
+                        else
+                        {
+                            bitmap.Dispose();
+                        }
                     });
                 }
-                catch (Exception)
+                catch (Exception exception)
                 {
-                    // A missing or undecodable image keeps the placeholder.
+                    Console.Error.WriteLine(
+                        $"[GUI][WARN] Could not load cover '{requestedCoverPath}': {exception.Message}");
                 }
             }
 
-            foreach (var game in games)
+            foreach (var game in gamesToMeasure)
             {
                 if (generation != _detailLoadGeneration)
                 {
@@ -822,7 +1406,7 @@ public partial class MainWindow : Window
                 {
                     Dispatcher.UIThread.Post(() =>
                     {
-                        if (generation == _detailLoadGeneration)
+                        if (generation == _detailLoadGeneration && _allGames.Contains(game))
                         {
                             game.SizeBytes = size;
                         }
@@ -857,9 +1441,10 @@ public partial class MainWindow : Window
                 total += file.Length;
             }
         }
-        catch (Exception)
+        catch (Exception exception)
         {
-            // Fall back to whatever was accumulated so far.
+            Console.Error.WriteLine(
+                $"[GUI][WARN] Could not measure game folder '{directory}': {exception.Message}");
         }
 
         return total;
@@ -868,7 +1453,7 @@ public partial class MainWindow : Window
     private static List<GameEntry> ScanFolders(IReadOnlyList<string> folders, IReadOnlySet<string> excludedPaths)
     {
         var games = new List<GameEntry>();
-        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var seen = new HashSet<string>(GameLibraryPath.Comparer);
         var enumeration = new EnumerationOptions
         {
             IgnoreInaccessible = true,
@@ -898,8 +1483,10 @@ public partial class MainWindow : Window
                     {
                         size = new FileInfo(fullPath).Length;
                     }
-                    catch (IOException)
+                    catch (IOException exception)
                     {
+                        Console.Error.WriteLine(
+                            $"[GUI][WARN] Could not inspect executable '{fullPath}': {exception.Message}");
                     }
 
                     var (title, titleId, version) = TryReadParamJson(fullPath);
@@ -908,9 +1495,10 @@ public partial class MainWindow : Window
                         FindCoverFor(fullPath), FindBackgroundFor(fullPath)));
                 }
             }
-            catch (Exception)
+            catch (Exception exception)
             {
-                // Skip folders that fail to enumerate.
+                Console.Error.WriteLine(
+                    $"[GUI][WARN] Could not scan game folder '{folder}': {exception.Message}");
             }
         }
 
@@ -1077,6 +1665,25 @@ public partial class MainWindow : Window
         GameList.SelectedItem = game;
         CtxLaunch.IsEnabled = !_isRunning;
         CtxCopyTitleId.IsEnabled = game.TitleId is not null;
+        CtxGameSettings.IsEnabled = !string.IsNullOrWhiteSpace(game.TitleId);
+    }
+
+    private void OpenSelectedGameSettings()
+    {
+        if (GameList.SelectedItem is not GameEntry game)
+        {
+            return;
+        }
+
+        if (string.IsNullOrWhiteSpace(game.TitleId))
+        {
+            AppendConsoleLine(
+                "[GUI][WARN] Per-game settings require a title ID, which this game does not have.",
+                WarningLineBrush);
+            return;
+        }
+
+        _ = new PerGameSettingsDialog(game.TitleId, game.Name, _settings).ShowDialog(this);
     }
 
     private void OpenSelectedGameFolder()
@@ -1132,24 +1739,26 @@ public partial class MainWindow : Window
             return;
         }
 
-        if (!_settings.ExcludedGames.Contains(game.Path, StringComparer.OrdinalIgnoreCase))
+        if (!_settings.ExcludedGames.Contains(game.Path, GameLibraryPath.Comparer))
         {
             _settings.ExcludedGames.Add(game.Path);
             _settings.Save();
         }
 
-        _allGames.RemoveAll(g => string.Equals(g.Path, game.Path, StringComparison.OrdinalIgnoreCase));
+        _allGames.RemoveAll(g =>
+            string.Equals(g.Path, game.Path, GameLibraryPath.Comparison));
         GameList.SelectedItem = null;
         RefreshVisibleGames();
         StatusBarRight.Text = Localization.Instance.Format("Status.RemovedFromLibrary", game.Name);
     }
 
-    private void RefreshVisibleGames()
+    private void RefreshVisibleGames(IReadOnlySet<GameEntry>? backgroundsChanged = null)
     {
         var query = SearchBox.Text?.Trim() ?? string.Empty;
-        var selectedPath = (GameList.SelectedItem as GameEntry)?.Path;
+        var selectedBefore = GameList.SelectedItem as GameEntry;
+        var selectedPath = selectedBefore?.Path;
+        var desired = new List<GameEntry>(_allGames.Count);
 
-        _visibleGames.Clear();
         foreach (var game in _allGames)
         {
             if (query.Length == 0 ||
@@ -1157,21 +1766,37 @@ public partial class MainWindow : Window
                 game.Path.Contains(query, StringComparison.OrdinalIgnoreCase) ||
                 (game.TitleId?.Contains(query, StringComparison.OrdinalIgnoreCase) ?? false))
             {
-                _visibleGames.Add(game);
+                desired.Add(game);
             }
         }
 
-        if (selectedPath is not null &&
-            _visibleGames.FirstOrDefault(g => g.Path.Equals(selectedPath, StringComparison.OrdinalIgnoreCase))
-                is { } reselected)
+        GameLibraryReconciler.ReconcileVisibleGames(_visibleGames, desired);
+
+        var selectedAfter = selectedPath is null
+            ? null
+            : _visibleGames.FirstOrDefault(game =>
+                game.Path.Equals(selectedPath, GameLibraryPath.Comparison));
+        if (!ReferenceEquals(GameList.SelectedItem, selectedAfter))
         {
-            GameList.SelectedItem = reselected;
+            GameList.SelectedItem = selectedAfter;
         }
 
         EmptyState.IsVisible = _visibleGames.Count == 0;
         UpdateEmptyStateTexts();
 
-        UpdateSelectedGame();
+        if (!ReferenceEquals(selectedBefore, selectedAfter))
+        {
+            UpdateSelectedGame();
+        }
+        else
+        {
+            UpdateSelectedGameTexts();
+            UpdateRunButtons();
+            if (selectedAfter is not null && backgroundsChanged?.Contains(selectedAfter) == true)
+            {
+                _ = UpdateBackdropAsync(selectedAfter);
+            }
+        }
     }
 
     /// <summary>
@@ -1281,13 +1906,25 @@ public partial class MainWindow : Window
         base.OnPropertyChanged(change);
         if (change.Property == WindowStateProperty)
         {
+            UpdateWindowChromeState();
+
+            // The XAML WindowState="Maximized" assignment raises this change
+            // during InitializeComponent, before named controls are wired up.
             if (WindowState == WindowState.Minimized)
             {
                 _sndPreview.Pause();
+                if (SessionLoadingPopup is { } popup)
+                {
+                    popup.IsOpen = false;
+                }
             }
             else
             {
                 _sndPreview.Resume();
+                if (SessionLoadingPopup is { } popup)
+                {
+                    popup.IsOpen = _sessionLoadingActive;
+                }
             }
         }
     }
@@ -1302,8 +1939,20 @@ public partial class MainWindow : Window
         var generation = ++_backdropGeneration;
         BackdropImage.Opacity = 0;
 
+        // The bundled key art is the primary backdrop whenever the selection
+        // has no art of its own; the window color stays as the last fallback.
+        void ShowDefaultBackdrop()
+        {
+            if (generation == _backdropGeneration && _defaultBackdrop is not null)
+            {
+                BackdropImage.Source = _defaultBackdrop;
+                BackdropImage.Opacity = 1.0;
+            }
+        }
+
         if (game?.BackgroundPath is null)
         {
+            ShowDefaultBackdrop();
             return;
         }
 
@@ -1320,7 +1969,8 @@ public partial class MainWindow : Window
             }
             catch (Exception)
             {
-                return; // undecodable key art: keep the plain background
+                ShowDefaultBackdrop(); // undecodable key art
+                return;
             }
         }
 
@@ -1369,132 +2019,103 @@ public partial class MainWindow : Window
             return;
         }
 
-        if (_emulatorExePath is null)
-        {
-            LocateEmulator();
-            if (_emulatorExePath is null)
-            {
-                AppendConsoleLine(Localization.Instance.Get("Launch.ExeNotFound"), ErrorLineBrush);
-                return;
-            }
-        }
+        var resolvedTitleId = string.IsNullOrWhiteSpace(titleId)
+            ? _allGames.FirstOrDefault(game =>
+                game.Path.Equals(ebootPath, GameLibraryPath.Comparison))?.TitleId
+            : titleId;
+        var effective = EffectiveLaunchSettings.Resolve(_settings, PerGameSettings.Load(resolvedTitleId));
 
         _sndPreview.Stop();
-
-        var arguments = new List<string>
-        {
-            "--cpu-engine=native",
-            $"--log-level={_settings.LogLevel.ToLowerInvariant()}",
-        };
-        if (_settings.StrictDynlibResolution)
-        {
-            arguments.Add("--strict");
-        }
-
-        if (_settings.ImportTraceLimit > 0)
-        {
-            arguments.Add($"--trace-imports={_settings.ImportTraceLimit}");
-        }
-
         _consoleLines.Clear();
+        _allConsoleLines.Clear();
 
-        // Let the CLI mirror stdout/stderr itself; it sees loader/native
-        // diagnostics before the GUI pipe reader can filter or batch them.
         DropFileLog();
-        if (_settings.LogToFile)
+        if (effective.LogToFile)
         {
-            string filePath;
-            if (!string.IsNullOrWhiteSpace(_settings.LogFilePath))
-            {
-                if (_settings.OverrideLogFile)
-                {
-                    filePath = _settings.LogFilePath;
-                }
-                else
-                {
-                    string path = _settings.LogFilePath;
-                    string id = string.IsNullOrWhiteSpace(titleId) ? "UNKNOWN" : titleId;
-                    foreach (var invalidChar in Path.GetInvalidFileNameChars())
-                    {
-                        id = id.Replace(invalidChar.ToString(), "");
-                    }
-                    string identifier = $"{id}-{DateTime.Now:yyyyMMdd-HHmmss}";
-
-                    string? dir = Path.GetDirectoryName(path);
-                    string? fileName = Path.GetFileNameWithoutExtension(path);
-                    string? extension = Path.GetExtension(path);
-
-                    string newFileName = $"{fileName}-{identifier}{extension}";
-                    filePath = string.IsNullOrEmpty(dir)
-                        ? newFileName
-                        : Path.Combine(dir, newFileName);
-                }
-            }
-            else
-            {
-                filePath = BuildLogFilePath(titleId) ?? string.Empty;
-            }
-
-            if (!string.IsNullOrEmpty(filePath))
-            {
-                arguments.Add("--log-file");
-                arguments.Add(filePath);
-                AppendConsoleLine(Localization.Instance.Format("Launch.LogFile", filePath), DimLineBrush);
-            }
+            OpenFileLog(resolvedTitleId);
         }
 
-        arguments.Add(ebootPath);
-
-        AppendConsoleLine(
-            Localization.Instance.Format("Launch.Command", string.Join(' ', arguments)),
-            DimLineBrush);
-
-        // Apply the enabled switches to this process; both emulator launch paths
-        // (CreateProcessW and Process.Start) inherit it. Clear switches turned
-        // off since the previous launch.
+        // The isolated game child inherits these diagnostics. Keep them on the
+        // launcher process so every platform receives the same launch options.
         foreach (var staleName in _appliedEnvironmentVariables)
         {
-            if (!_settings.EnvironmentToggles.Contains(staleName))
+            if (!effective.EnvironmentToggles.Any(entry =>
+                    TryParseEnvironmentEntry(entry, out var name, out _) &&
+                    string.Equals(name, staleName, StringComparison.OrdinalIgnoreCase)))
             {
                 Environment.SetEnvironmentVariable(staleName, null);
             }
         }
 
         _appliedEnvironmentVariables.Clear();
-        foreach (var name in _settings.EnvironmentToggles)
+        foreach (var entry in effective.EnvironmentToggles)
         {
-            Environment.SetEnvironmentVariable(name, "1");
+            if (!TryParseEnvironmentEntry(entry, out var name, out var value))
+            {
+                continue;
+            }
+
+            if (string.Equals(name, DefaultProfileEnvironmentName, StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            Environment.SetEnvironmentVariable(name, value);
             _appliedEnvironmentVariables.Add(name);
         }
 
-        var emulator = new EmulatorProcess();
-        emulator.OutputReceived += (line, isError) => _pendingLines.Enqueue((line, isError));
-        emulator.Exited += code => Dispatcher.UIThread.Post(() => OnEmulatorExited(code));
+        Environment.SetEnvironmentVariable(
+            DefaultProfileEnvironmentName,
+            GuiSettings.NormalizeDefaultProfile(_settings.DefaultProfile));
+        _appliedEnvironmentVariables.Add(DefaultProfileEnvironmentName);
 
-        try
+        Environment.SetEnvironmentVariable(
+            "SHARPEMU_RENDER_SCALE",
+            _settings.RenderResolutionScale.ToString(
+                "0.###",
+                System.Globalization.CultureInfo.InvariantCulture));
+
+        if (SharpEmuLog.TryParseLevel(effective.LogLevel, out var logLevel))
         {
-            emulator.Start(_emulatorExePath, arguments, Path.GetDirectoryName(ebootPath));
-        }
-        catch (Exception ex)
-        {
-            emulator.Dispose();
-            AppendConsoleLine(Localization.Instance.Format("Launch.StartFailed", ex.Message), ErrorLineBrush);
-            DropFileLog();
-            return;
+            SharpEmuLog.MinimumLevel = logLevel;
         }
 
-        _emulator = emulator;
+        var runtimeOptions = new SharpEmuRuntimeOptions
+        {
+            CpuEngine = CpuExecutionEngine.NativeOnly,
+            StrictDynlibResolution = effective.StrictDynlibResolution,
+            ImportTraceLimit = Math.Max(0, effective.ImportTraceLimit),
+        };
+
         _isRunning = true;
         _runningGameName = displayName;
-        _runningGameTitleId = _allGames
-            .FirstOrDefault(game => game.Path.Equals(ebootPath, StringComparison.OrdinalIgnoreCase))?
-            .TitleId;
+        _runningGameTitleId = resolvedTitleId;
         _runningSinceUnixSeconds = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
         StatusDot.Fill = SuccessLineBrush;
         StatusText.Text = Localization.Instance.Format("Launch.Running", displayName);
         StatusBarRight.Text = Localization.Instance.Format("Status.Running", displayName);
         UpdateRunButtons();
         UpdateDiscordPresence();
+
+        BeginSessionUi();
+        _pendingLaunch = new PendingLaunch(
+            Path.GetFullPath(ebootPath),
+            displayName,
+            _runningGameTitleId,
+            effective,
+            runtimeOptions);
+
+        StartPendingSession();
+    }
+
+    private static bool TryParseEnvironmentEntry(string entry, out string name, out string value)
+    {
+        var separator = entry.IndexOf('=');
+        name = separator >= 0 ? entry[..separator] : entry;
+        value = separator >= 0 ? entry[(separator + 1)..] : "1";
+        return name.StartsWith("SHARPEMU_", StringComparison.OrdinalIgnoreCase) &&
+               name.Length > "SHARPEMU_".Length &&
+               value.Length != 0;
     }
 
     /// <summary>
@@ -1506,17 +2127,31 @@ public partial class MainWindow : Window
     /// </summary>
     private void StopEmulator()
     {
-        if (!_isRunning)
+        if (!_isRunning || _isStopping)
         {
             return;
         }
 
-        _emulator?.Stop();
+        if (_emulator is null)
+        {
+            // The native host can be created a moment after Launch. Do not
+            // let that delayed callback start a session the user already
+            // cancelled.
+            _pendingLaunch = null;
+            OnEmulatorExited(0);
+            return;
+        }
+
+        _isStopping = true;
+        StopButton.IsEnabled = false;
+        ShowSessionLoading("Closing game", "Waiting for the emulation session to exit...");
+        _emulator.Stop();
         _runningGameName = null;
         _runningGameTitleId = null;
         StatusText.Text = Localization.Instance.Get("Launch.Stopping");
         StatusBarRight.Text = Localization.Instance.Get("Status.Stopping");
         UpdateDiscordPresence();
+        ReturnToLibraryWhileStopping();
     }
 
     /// <summary>
@@ -1527,7 +2162,7 @@ public partial class MainWindow : Window
     {
         try
         {
-            var exeDirectory = Path.GetDirectoryName(_emulatorExePath);
+            var exeDirectory = Path.GetDirectoryName(_emulatorExePath) ?? AppContext.BaseDirectory;
             if (string.IsNullOrEmpty(exeDirectory))
             {
                 return null;
@@ -1554,8 +2189,11 @@ public partial class MainWindow : Window
     {
         FlushPendingConsoleLines();
         _isRunning = false;
+        _isStopping = false;
         _emulator?.Dispose();
         _emulator = null;
+        _pendingLaunch = null;
+        EndSessionUi();
 
         var meaningKey = exitCode switch
         {
@@ -1567,13 +2205,20 @@ public partial class MainWindow : Window
             -1073741819 => "Exit.EmulationError",
             _ => "Exit.Unknown",
         };
+        var stoppedByUser = exitCode == EmulatorProcess.HostStopExitCode;
         var meaning = Localization.Instance.Get(meaningKey);
-        var brush = exitCode == 0 ? SuccessLineBrush : ErrorLineBrush;
-        AppendConsoleLine(Localization.Instance.Format("Launch.ProcessExited", exitCode, meaning), brush);
+        var brush = exitCode == 0 || stoppedByUser ? SuccessLineBrush : ErrorLineBrush;
+        AppendConsoleLine(
+            stoppedByUser
+                ? "Game closed by the user."
+                : Localization.Instance.Format("Launch.ProcessExited", exitCode, meaning),
+            brush);
         CloseFileLogSoon();
 
-        StatusDot.Fill = exitCode == 0 ? (IBrush)SuccessLineBrush : ErrorLineBrush;
-        StatusText.Text = Localization.Instance.Format("Launch.Exited", exitCode, meaning);
+        StatusDot.Fill = exitCode == 0 || stoppedByUser ? (IBrush)SuccessLineBrush : ErrorLineBrush;
+        StatusText.Text = stoppedByUser
+            ? "Game closed by the user."
+            : Localization.Instance.Format("Launch.Exited", exitCode, meaning);
         StatusBarRight.Text = Localization.Instance.Get("Status.Idle");
         _runningGameName = null;
         _runningGameTitleId = null;
@@ -1581,10 +2226,268 @@ public partial class MainWindow : Window
         UpdateDiscordPresence();
     }
 
+    private void StartPendingSession()
+    {
+        if (_pendingLaunch is not { } launch || _emulator is not null)
+        {
+            return;
+        }
+
+        if (string.IsNullOrWhiteSpace(_emulatorExePath))
+        {
+            AppendConsoleLine(Localization.Instance.Get("Launch.ExeNotFound"), ErrorLineBrush);
+            OnEmulatorExited(3);
+            return;
+        }
+
+        var process = new EmulatorProcess();
+        process.OutputReceived += OnEmulatorOutput;
+        process.Exited += code => Dispatcher.UIThread.Post(() => OnEmulatorExited(code));
+
+        try
+        {
+            var arguments = BuildEmulatorArguments(launch);
+            _emulator = process;
+            _pendingLaunch = null;
+            process.Start(
+                _emulatorExePath,
+                arguments,
+                Path.GetDirectoryName(_emulatorExePath));
+            AppendConsoleLine(
+                Localization.Instance.Format("Launch.Command", launch.EbootPath),
+                DimLineBrush);
+        }
+        catch (Exception exception)
+        {
+            _emulator = null;
+            process.Dispose();
+            AppendConsoleLine(
+                Localization.Instance.Format("Launch.StartFailed", exception.Message),
+                ErrorLineBrush);
+            OnEmulatorExited(3);
+        }
+    }
+
+    private List<string> BuildEmulatorArguments(PendingLaunch launch)
+    {
+        var arguments = new List<string>
+        {
+            "--cpu-engine=native",
+            $"--log-level={launch.Settings.LogLevel}",
+        };
+        if (launch.RuntimeOptions.StrictDynlibResolution)
+        {
+            arguments.Add("--strict");
+        }
+        if (launch.RuntimeOptions.ImportTraceLimit > 0)
+        {
+            arguments.Add($"--trace-imports={launch.RuntimeOptions.ImportTraceLimit}");
+        }
+
+        arguments.Add($"--window-mode={launch.Settings.WindowMode.ToLowerInvariant()}");
+        arguments.Add($"--resolution={launch.Settings.Resolution}");
+        arguments.Add($"--display={launch.Settings.DisplayIndex}");
+        arguments.Add($"--refresh-rate={launch.Settings.RefreshRate}");
+        arguments.Add($"--scaling={launch.Settings.ScalingMode.ToLowerInvariant()}");
+        arguments.Add($"--vsync={(launch.Settings.VSync ? "on" : "off")}");
+        arguments.Add($"--hdr={launch.Settings.HdrMode.ToLowerInvariant()}");
+
+        arguments.Add(launch.EbootPath);
+        return arguments;
+    }
+
+    private void OnEmulatorOutput(string line, bool isError)
+    {
+        _pendingLines.Enqueue((line, isError));
+        if (!line.Contains("Vulkan VideoOut presented first frame:", StringComparison.Ordinal) &&
+            !line.Contains("Vulkan VideoOut ready:", StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        Dispatcher.UIThread.Post(() =>
+        {
+            if (_isRunning && !_isStopping)
+            {
+                ShowSessionStatus("Game is running");
+            }
+        });
+    }
+
+    private void BeginSessionUi()
+    {
+        _isStopping = false;
+        AnimateLibraryBlur(LaunchBlurRadius);
+        ShowSessionLoading("Loading game", "Preparing the emulation session...");
+        LaunchBar.IsVisible = true;
+    }
+
+    private void EndSessionUi()
+    {
+        HideSessionLoading();
+        AnimateLibraryBlur(0, clearWhenComplete: true);
+        LaunchBar.IsVisible = true;
+        ConsolePanel.IsVisible = ConsoleToggle.IsChecked == true && _consoleWindow is null;
+    }
+
+    private void AnimateLibraryBlur(double targetRadius, bool clearWhenComplete = false)
+    {
+        _libraryBlur ??= new BlurEffect();
+        PagesHost.Effect = _libraryBlur;
+
+        _libraryBlurStartRadius = _libraryBlur.Radius;
+        _libraryBlurTargetRadius = Math.Max(0, targetRadius);
+        _libraryBlurStartedAt = Stopwatch.GetTimestamp();
+        _clearLibraryBlurWhenComplete = clearWhenComplete && _libraryBlurTargetRadius == 0;
+
+        if (Math.Abs(_libraryBlurStartRadius - _libraryBlurTargetRadius) < 0.01)
+        {
+            CompleteLibraryBlur();
+            return;
+        }
+
+        _libraryBlurTimer.Start();
+    }
+
+    private void AdvanceLibraryBlur()
+    {
+        if (_libraryBlur is null)
+        {
+            _libraryBlurTimer.Stop();
+            return;
+        }
+
+        var elapsed = (Stopwatch.GetTimestamp() - _libraryBlurStartedAt) /
+                      (double)Stopwatch.Frequency;
+        var progress = Math.Clamp(elapsed / BlurTransitionSeconds, 0, 1);
+        // Cubic ease-out gives the loading transition a quick response while
+        // keeping the final change of sharpness unobtrusive.
+        var easedProgress = 1 - Math.Pow(1 - progress, 3);
+        _libraryBlur.Radius = _libraryBlurStartRadius +
+                              ((_libraryBlurTargetRadius - _libraryBlurStartRadius) * easedProgress);
+
+        if (progress >= 1)
+        {
+            CompleteLibraryBlur();
+        }
+    }
+
+    private void CompleteLibraryBlur()
+    {
+        _libraryBlurTimer.Stop();
+        if (_libraryBlur is not null)
+        {
+            _libraryBlur.Radius = _libraryBlurTargetRadius;
+        }
+
+        if (_clearLibraryBlurWhenComplete)
+        {
+            PagesHost.Effect = null;
+            _libraryBlur = null;
+            _clearLibraryBlurWhenComplete = false;
+        }
+    }
+
+    private void ClearLibraryBlur()
+    {
+        _libraryBlurTimer.Stop();
+        _libraryBlur = null;
+        _clearLibraryBlurWhenComplete = false;
+        PagesHost.Effect = null;
+    }
+
+    private void ShowSessionLoading(string title, string detail)
+    {
+        SessionLoadingTitle.Text = title;
+        SessionLoadingTitle.IsVisible = true;
+        SessionLoadingDetail.Text = detail;
+        SessionLoadingDetail.IsVisible = true;
+        SessionLoadingProgress.IsVisible = true;
+        _sessionLoadingActive = true;
+        SessionLoadingPopup.IsOpen = IsActive && WindowState != WindowState.Minimized;
+    }
+
+    private void ShowSessionStatus(string message)
+    {
+        SessionLoadingTitle.Text = message;
+        SessionLoadingTitle.IsVisible = true;
+        SessionLoadingDetail.IsVisible = false;
+        SessionLoadingProgress.IsVisible = false;
+        _sessionLoadingActive = true;
+        SessionLoadingPopup.IsOpen = IsActive && WindowState != WindowState.Minimized;
+    }
+
+    private void HideSessionLoading()
+    {
+        _sessionLoadingActive = false;
+        SessionLoadingPopup.IsOpen = false;
+    }
+
+    private void ReturnToLibraryWhileStopping()
+    {
+        AnimateLibraryBlur(LaunchBlurRadius);
+        ConsolePanel.IsVisible = ConsoleToggle.IsChecked == true && _consoleWindow is null;
+        LaunchBar.IsVisible = true;
+        UpdateRunButtons();
+        Console.Error.WriteLine("[GUI][INFO] Waiting for the SDL game process to exit.");
+    }
+
+    private void OpenFileLog(string? titleId)
+    {
+        var filePath = ResolveLogFilePath(titleId);
+        if (string.IsNullOrWhiteSpace(filePath))
+        {
+            return;
+        }
+
+        try
+        {
+            var directory = Path.GetDirectoryName(filePath);
+            if (!string.IsNullOrEmpty(directory))
+            {
+                Directory.CreateDirectory(directory);
+            }
+
+            _fileLog = new StreamWriter(filePath, append: false) { AutoFlush = true };
+            AppendConsoleLine(Localization.Instance.Format("Launch.LogFile", filePath), DimLineBrush);
+        }
+        catch (Exception exception)
+        {
+            AppendConsoleLine($"[GUI][WARN] Could not open log file: {exception.Message}", WarningLineBrush);
+            DropFileLog();
+        }
+    }
+
+    private string? ResolveLogFilePath(string? titleId)
+    {
+        if (string.IsNullOrWhiteSpace(_settings.LogFilePath))
+        {
+            return BuildLogFilePath(titleId);
+        }
+
+        if (_settings.OverrideLogFile)
+        {
+            return _settings.LogFilePath;
+        }
+
+        var path = _settings.LogFilePath;
+        var id = string.IsNullOrWhiteSpace(titleId) ? "UNKNOWN" : titleId;
+        foreach (var invalid in Path.GetInvalidFileNameChars())
+        {
+            id = id.Replace(invalid.ToString(), string.Empty, StringComparison.Ordinal);
+        }
+
+        var directory = Path.GetDirectoryName(path);
+        var filename = Path.GetFileNameWithoutExtension(path);
+        var extension = Path.GetExtension(path);
+        var timestampedName = $"{filename}-{id}-{DateTime.Now:yyyyMMdd-HHmmss}{extension}";
+        return string.IsNullOrEmpty(directory) ? timestampedName : Path.Combine(directory, timestampedName);
+    }
+
     private void UpdateRunButtons()
     {
         LaunchButton.IsEnabled = !_isRunning && GameList.SelectedItem is GameEntry;
-        StopButton.IsEnabled = _isRunning;
+        StopButton.IsEnabled = _isRunning && !_isStopping;
         OpenFileButton.IsEnabled = !_isRunning;
     }
 

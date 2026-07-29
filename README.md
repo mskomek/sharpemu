@@ -13,21 +13,21 @@ SPDX-License-Identifier: GPL-2.0-or-later
   An experimental PlayStation 5 emulator for Windows, Linux and macOS.  
 </p>
 
-<p align="center">
-  <a href="https://discord.gg/6GejPEDqpc">
-    <img src="https://img.shields.io/badge/Discord-Join%20our%20Community-5865F2?style=for-the-badge&logo=discord&logoColor=white" alt="Join our Discord">
-  </a>
-</p>
+---
 
 <p align="center">
-  <strong>Join our Discord for development updates, compatibility discussions, support, and community chat.</strong>
+  <a href="#support">
+    <img src="https://img.shields.io/badge/Support-GitHub%20Sponsors%20%26%20Crypto-EA4AAA?style=for-the-badge&logo=githubsponsors&logoColor=white" alt="Support SharpEmu">
+  </a>
 </p>
 
 ---
 
 > [!NOTE]  
 > SharpEmu supports Windows x64, Linux x64, and macOS x64. Apple Silicon Macs
-> can run the macOS x64 build through Rosetta 2.
+> can run the macOS x64 build through Rosetta 2, and Windows on ARM devices
+> (e.g. Snapdragon) can run the Windows x64 build through Windows' built-in
+> x64 emulation.
 
 > [!WARNING]  
 > SharpEmu is an experimental PS5 emulator developed from scratch in C#. The current focus is on accuracy and infrastructure setup rather than game-specific compatibility.
@@ -40,6 +40,16 @@ This project is developed purely for research and educational purposes. There ar
 
 SharpEmu focuses exclusively on the PlayStation 5.  
 Our goal is **not** to emulate PS4 games, as there is already an excellent emulator dedicated to that platform: **ShadPS4**.
+
+## Games Tested
+
+|               Demons Souls Remake                   |                     Dreaming Sarah                         |
+| :-----------------------------------------------------------: | :--------------------------------------------------------------------------------------------: |
+| ![Bloodborne screenshot](./.github/images/demons-souls.jpg) | ![Dreaming Sarah](./.github/images/dreaming-sarah.jpg) |
+
+|                  Void Terrarium                     |                 Dead Cells                    |
+| :------------------------------------------------------------------------: | :------------------------------------------------------------------: |
+| ![Void Terrarium](./.github/images/void-terrarium.jpg) | ![Dead Cells](./.github/images/dead-cells.jpg) |
 
 ## Status
 
@@ -88,25 +98,6 @@ chmod +x ./SharpEmu
 A Vulkan-capable GPU and current graphics driver are required. The macOS
 release includes the MoltenVK Vulkan implementation.
 
-## Games Tested
-
-* **Demon's Souls Remake**
-  * [Demon's Souls [PPSA01341]](https://github.com/par274/sharpemu/issues/2)
-  * Demon's Souls is now video loop. Shaders are ready to be converted to SPIR-V/Vulkan. We are continuing our work on this.
-  ![DeS videoOut submit first frame](./.github/images/des-videoout-shaders.jpg)
-
-* **Poppy Playtime Chapter 1**
-  * [Poppy Playtime Chapter 1 [PPSA20591]](https://github.com/par274/sharpemu/issues/3)
-
-* **SILENT HILL: The Short Message**
-  * [SILENT HILL: The Short Message [PPSA10112]](https://github.com/par274/sharpemu/issues/4)
-
-* **Dreaming Sarah**
-  * [Dreaming Sarah [PPSA02929]](https://github.com/par274/sharpemu/issues/9)
-  * Real texture rendering for this game;
-  ![Splash texture](./.github/images/dreaming-sarah.jpg)
-
-
 > [!IMPORTANT]  
 > This project does **not** support or condone piracy.  
 > All games used during development and testing are dumped from consoles that we personally own.  
@@ -115,7 +106,7 @@ release includes the MoltenVK Vulkan implementation.
 ## Build
 
 1. Install the .NET SDK version specified in [`global.json`](./global.json).
-2. Clone the repository: `git clone https://github.com/par274/sharpemu.git`
+2. Clone the repository: `git clone https://github.com/sharpemu/sharpemu.git`
 3. Open the solution file (`SharpEmu.slnx`) in **VSCode**.
 4. Build the project: `dotnet build` or `dotnet publish`
 5. Build artifacts will be located in the `artifacts` directory.
@@ -141,7 +132,19 @@ Provided valuable references for filesystem handling and low-level C# implementa
 
 # License
 
-- [**GPL-2.0 license**](https://github.com/par274/sharpemu/blob/main/LICENSE)
+- [**GPL-2.0 license**](https://github.com/sharpemu/sharpemu/blob/main/LICENSE)
+
+## Support
+
+Support SharpEmu via GitHub Sponsors or cryptocurrency. Every contribution helps fund ongoing development and long-term maintenance. GitHub Sponsors is the preferred way to support the project, but cryptocurrency donations are also appreciated.
+
+### ETH/USDT
+
+`0xF315F5d986c790bB3A58DbE60F1B2760997dEd82`
+
+### BTC
+
+`bc1qmr9k8899njys5ny63xsues4jgmkk96erslrkmv`
 
 ## Contributing
 
